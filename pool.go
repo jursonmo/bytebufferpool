@@ -67,11 +67,11 @@ func Put(b *ByteBuffer) { defaultPool.Put(b) }
 func (p *Pool) Put(b *ByteBuffer) {
 	idx := index(len(b.B))
 
-	if atomic.AddUint64(&p.calls[idx], 1) > calibrateCallsThreshold {
-		p.calibrate()
+	if atomic.AddUint64(&p.calls[idx], 1) > calibrateCallsThreshold { //每次只要有任意一级别大小的内存的调用次数超过calibrateCallsThreshold，就重新校准
+		p.calibrate() //校准是为了确定 p.defaultSize, p.maxSize 两个值，
 	}
 
-	maxSize := int(atomic.LoadUint64(&p.maxSize))
+	maxSize := int(atomic.LoadUint64(&p.maxSize)) //超过p.maxSize的内存，在put时就不要放到sync.pool 里了
 	if maxSize == 0 || cap(b.B) <= maxSize {
 		b.Reset()
 		p.pool.Put(b)
@@ -86,31 +86,40 @@ func (p *Pool) calibrate() {
 	a := make(callSizes, 0, steps)
 	var callsSum uint64
 	for i := uint64(0); i < steps; i++ {
-		calls := atomic.SwapUint64(&p.calls[i], 0)
+		calls := atomic.SwapUint64(&p.calls[i], 0) //重置pool 的调用次数
 		callsSum += calls
 		a = append(a, callSize{
 			calls: calls,
 			size:  minSize << i,
 		})
 	}
-	sort.Sort(a)
+	sort.Sort(a) //根据calls 降序排序
 
-	defaultSize := a[0].size
+	defaultSize := a[0].size //调用次数最多的size, 即最常用的内存size,其实应算下超过60%概率的最大大小作为defaultSize
 	maxSize := defaultSize
 
+	defSum := uint64(float64(callsSum) * 0.6) //add by mo
 	maxSum := uint64(float64(callsSum) * maxPercentile)
 	callsSum = 0
-	for i := 0; i < steps; i++ {
+	for i := 0; i < steps; i++ { //确定maxSize的值，在百分之九十五的使用次数中选出最大的内存size
 		if callsSum > maxSum {
 			break
 		}
 		callsSum += a[i].calls
 		size := a[i].size
-		if size > maxSize {
+		if size > maxSize { //记录最大的size
 			maxSize = size
 		}
+		//add by mo算下超过60%概率的最大大小作为defaultSize
+		if callsSum > defSum && defaultSize == a[0].size {
+			defaultSize = maxSize
+		}
+		//end by mo
 	}
 
+	//此函数就是根据一段时间内存的使用情况来校准 p.defaultSize, p.maxSize 两个值，
+	//p.defaultSize作用：pool.Get()时，默认分配的内存大小，这类大小的内存使用率最高，即使用过程中内存append的可能性就低了。
+	//p.maxSize作用：超过p.maxSize的内存，在put时就不要放到sync.pool 里了，应为这种大小的内存，使用率只有5%
 	atomic.StoreUint64(&p.defaultSize, defaultSize)
 	atomic.StoreUint64(&p.maxSize, maxSize)
 
